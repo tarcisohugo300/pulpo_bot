@@ -71,22 +71,24 @@ function verificarOtpStore(tel, cod) {
 setInterval(() => { const n = Date.now(); for (const [t, e] of otpStore) if (n > e.expira) otpStore.delete(t); }, 300_000);
 
 // ── WhatsApp ──────────────────────────────────────────────────────────────────
-let waSocket = null;
-let waListo  = false;
-let qrActual = null;
-let intentosFallidos = 0;
+let waSocket        = null;
+let waListo         = false;
+let pairingCode     = null;   // código de 8 letras para vincular sin QR
+let pairingPending  = false;  // esperando que el usuario ingrese el código
 
 function limpiarSesion() {
     try { fs.rmSync('wa_session', { recursive: true, force: true }); } catch (_) {}
     console.log('🗑️  Sesión limpiada');
 }
 
-async function conectarWhatsApp() {
+async function conectarWhatsApp(telefono = null) {
     try {
         const { state, saveCreds } = await useMultiFileAuthState('wa_session');
         const logger = P({ level: 'silent' });
 
         if (waSocket) { try { waSocket.end(); } catch (_) {} waSocket = null; }
+
+        const yaRegistrado = !!state.creds.me;
 
         waSocket = makeWASocket({
             auth: {
@@ -94,29 +96,36 @@ async function conectarWhatsApp() {
                 keys: makeCacheableSignalKeyStore(state.keys, logger),
             },
             logger,
-            browser           : ['Ubuntu', 'Chrome', '120.0.0'],
-            connectTimeoutMs  : 60_000,
-            keepAliveIntervalMs: 30_000,
+            browser              : ['Ubuntu', 'Chrome', '120.0.0'],
+            connectTimeoutMs     : 60_000,
+            keepAliveIntervalMs  : 30_000,
             defaultQueryTimeoutMs: 60_000,
-            syncFullHistory   : false,
-            markOnlineOnConnect: false,
+            syncFullHistory      : false,
+            markOnlineOnConnect  : false,
         });
 
         waSocket.ev.on('creds.update', saveCreds);
 
-        waSocket.ev.on('connection.update', async (update) => {
-            const { connection, lastDisconnect, qr } = update;
-
-            if (qr) {
-                intentosFallidos = 0;
-                qrActual = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(qr)}`;
-                console.log('📱 QR generado — visita /api/qr para escanearlo');
+        // Si no hay sesión guardada y se pasó un teléfono → pedir código de vinculación
+        if (!yaRegistrado && telefono) {
+            try {
+                await new Promise(r => setTimeout(r, 3000)); // esperar handshake
+                const numero = telefono.replace(/[^0-9]/g, '');
+                pairingCode    = await waSocket.requestPairingCode(numero);
+                pairingPending = true;
+                console.log(`🔑 Código de vinculación: ${pairingCode}`);
+            } catch (e) {
+                console.error('❌ Error obteniendo código:', e.message);
             }
+        }
+
+        waSocket.ev.on('connection.update', async (update) => {
+            const { connection, lastDisconnect } = update;
 
             if (connection === 'open') {
-                waListo  = true;
-                qrActual = null;
-                intentosFallidos = 0;
+                waListo        = true;
+                pairingCode    = null;
+                pairingPending = false;
                 console.log('✅ WhatsApp conectado y listo');
             }
 
@@ -124,32 +133,20 @@ async function conectarWhatsApp() {
                 waListo = false;
                 const code = lastDisconnect?.error instanceof Boom
                     ? lastDisconnect.error.output?.statusCode : undefined;
-
                 console.warn(`⚠️  Desconectado (código ${code})`);
 
                 if (code === DisconnectReason.loggedOut) {
-                    console.error('❌ Sesión cerrada. Visita /api/qr → Reiniciar para vincular de nuevo.');
                     limpiarSesion();
-                    setTimeout(conectarWhatsApp, 5_000);
-                    return;
+                    pairingCode    = null;
+                    pairingPending = false;
                 }
-
-                // Si falla muchas veces sin generar QR → limpiar sesión y reintentar
-                intentosFallidos++;
-                if (intentosFallidos >= 5) {
-                    console.warn('⚠️  Muchos fallos — limpiando sesión para forzar QR nuevo');
-                    limpiarSesion();
-                    intentosFallidos = 0;
-                }
-
-                const delay = intentosFallidos > 2 ? 15_000 : 5_000;
-                setTimeout(conectarWhatsApp, delay);
+                setTimeout(() => conectarWhatsApp(), 8_000);
             }
         });
 
     } catch (err) {
         console.error('❌ Error iniciando WhatsApp:', err.message);
-        setTimeout(conectarWhatsApp, 10_000);
+        setTimeout(() => conectarWhatsApp(), 10_000);
     }
 }
 
@@ -170,55 +167,83 @@ async function enviarSms(telefono, codigo) {
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.use(express.urlencoded({ extended: false }));
 
-// GET /api/qr
+// GET /api/qr — panel de vinculación
 app.get('/api/qr', (_req, res) => {
+    const style = `font-family:sans-serif;text-align:center;padding:40px;max-width:500px;margin:0 auto`;
+
     if (waListo) {
-        return res.send(`<html><body style="font-family:sans-serif;text-align:center;padding:40px;background:#f0fff0">
-            <h2 style="color:green">✅ WhatsApp ya está conectado</h2>
-            <p>El bot está activo y funcionando.</p>
-            <a href="/api/status">Ver estado</a>
+        return res.send(`<html><body style="${style};background:#f0fff0">
+            <h2 style="color:green">✅ WhatsApp conectado</h2>
+            <p>El bot está activo.</p>
+            <a href="/api/status">Ver estado completo</a>
         </body></html>`);
     }
 
-    const resetBtn = `
-        <form method="POST" action="/api/reset-wa" style="margin-top:20px">
-            <button type="submit" style="background:#e53935;color:white;border:none;padding:10px 24px;border-radius:6px;cursor:pointer;font-size:14px">
-                🔄 Reiniciar conexión
+    if (pairingPending && pairingCode) {
+        return res.send(`<html>
+        <head><meta http-equiv="refresh" content="10"></head>
+        <body style="${style};background:#e8f5e9">
+            <h2>🔑 Código de vinculación</h2>
+            <div style="font-size:48px;font-weight:bold;letter-spacing:8px;color:#1b5e20;margin:20px 0;background:#fff;padding:20px;border-radius:12px;border:3px solid #4caf50">
+                ${pairingCode}
+            </div>
+            <p><strong>Pasos:</strong></p>
+            <ol style="text-align:left;display:inline-block">
+                <li>Abre WhatsApp en tu teléfono</li>
+                <li>Ve a <strong>Dispositivos vinculados</strong></li>
+                <li>Toca <strong>Vincular con número de teléfono</strong></li>
+                <li>Ingresa el código de arriba</li>
+            </ol>
+            <p style="color:gray;font-size:13px">Esta página se recarga sola. El código expira en ~60 seg.</p>
+        </body></html>`);
+    }
+
+    // Sin sesión y sin código → mostrar formulario para pedir teléfono
+    res.send(`<html><body style="${style};background:#f5f5f5">
+        <h2>📱 Vincular WhatsApp</h2>
+        <p>Ingresa el número de teléfono del WhatsApp que usará el bot<br>
+        <small style="color:gray">(con código de país, sin espacios ni +)</small></p>
+        <form method="POST" action="/api/pair">
+            <input name="telefono" placeholder="258841234567" required
+                style="padding:12px;font-size:18px;width:260px;border-radius:8px;border:2px solid #333;text-align:center"/>
+            <br><br>
+            <button type="submit"
+                style="background:#1976d2;color:white;border:none;padding:12px 32px;border-radius:8px;font-size:16px;cursor:pointer">
+                Obtener código →
             </button>
         </form>
-        <p style="color:gray;font-size:12px">Usa esto si el QR no aparece después de 30 segundos</p>`;
-
-    if (!qrActual) {
-        return res.send(`<html>
-            <head><meta http-equiv="refresh" content="5"></head>
-            <body style="font-family:sans-serif;text-align:center;padding:40px;background:#fffbe6">
-                <h2>⏳ Generando QR...</h2>
-                <p>Esta página se actualiza cada 5 segundos.</p>
-                ${resetBtn}
-            </body></html>`);
-    }
-
-    res.send(`<html>
-        <head><meta http-equiv="refresh" content="25"></head>
-        <body style="font-family:sans-serif;text-align:center;padding:40px;background:#f5f5f5">
-            <h2>📱 Escanea con WhatsApp</h2>
-            <p>Abre WhatsApp → Dispositivos vinculados → Vincular dispositivo</p>
-            <img src="${qrActual}" style="border:4px solid #333;border-radius:8px;margin:20px"/>
-            <p style="color:gray;font-size:13px">QR se recarga solo cada 25 seg.</p>
-            ${resetBtn}
-        </body></html>`);
+        <br>
+        <form method="POST" action="/api/reset-wa">
+            <button type="submit" style="background:#e53935;color:white;border:none;padding:8px 20px;border-radius:6px;font-size:13px;cursor:pointer">
+                🗑️ Limpiar sesión y reiniciar
+            </button>
+        </form>
+    </body></html>`);
 });
 
-// POST /api/reset-wa — fuerza sesión limpia y reconexión
-app.post('/api/reset-wa', async (_req, res) => {
-    console.log('🔄 Reset manual solicitado');
-    waListo  = false;
-    qrActual = null;
-    intentosFallidos = 0;
+// POST /api/pair — solicita código de vinculación por teléfono
+app.post('/api/pair', async (req, res) => {
+    const { telefono } = req.body;
+    if (!telefono) return res.redirect('/api/qr');
+    console.log(`🔑 Solicitando código para: ${telefono}`);
+    pairingCode    = null;
+    pairingPending = false;
+    waListo        = false;
     if (waSocket) { try { waSocket.end(); } catch (_) {} waSocket = null; }
     limpiarSesion();
-    setTimeout(conectarWhatsApp, 1_000);
+    setTimeout(() => conectarWhatsApp(telefono), 1_000);
+    res.redirect('/api/qr');
+});
+
+// POST /api/reset-wa
+app.post('/api/reset-wa', async (_req, res) => {
+    console.log('🔄 Reset manual');
+    waListo = false; pairingCode = null; pairingPending = false;
+    if (waSocket) { try { waSocket.end(); } catch (_) {} waSocket = null; }
+    limpiarSesion();
+    setTimeout(() => conectarWhatsApp(), 1_000);
     res.redirect('/api/qr');
 });
 
